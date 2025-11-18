@@ -629,14 +629,17 @@ def main():
         batch_size=config['Model']['train_batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4
+        num_workers=0
     )
 
     optimizer = setup_optimizer(model, config)
     scheduler, num_training_steps = setup_scheduler(optimizer, config, train_dataloader)
 
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(model, optimizer, train_dataloader, scheduler)
-    vae, text_encoder, clip_model = accelerator.prepare(vae), accelerator.prepare(text_encoder), accelerator.prepare(clip_model)
+
+    # Only prepare VAE and encoders if not using cache (they would be None if cache is enabled)
+    if not use_cache:
+        vae, text_encoder, clip_model = accelerator.prepare(vae), accelerator.prepare(text_encoder), accelerator.prepare(clip_model)
 
     start_step = load_checkpoint(accelerator, model, optimizer, scheduler, config)
 
