@@ -741,8 +741,8 @@ class NextDiT(nn.Module):
             H, W = img_sizes[0]
             H_tokens, W_tokens = H // pH, W // pW
             img_len = l_effective_img_len[0]
-            max_cap_len = max(l_effective_cap_len)
-            max_seq_len = max_cap_len + img_len
+            fixed_cap_len = cap_feats.shape[1]
+            max_seq_len = fixed_cap_len + img_len
 
             if isinstance(x, torch.Tensor):
                 x_batch = x
@@ -753,24 +753,21 @@ class NextDiT(nn.Module):
             x_patches = x_batch.view(bsz, C, H // pH, pH, W // pW, pW).permute(0, 2, 4, 3, 5, 1).flatten(3).flatten(1, 2)
 
             position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
+
+            cap_range = torch.arange(fixed_cap_len, dtype=torch.int32, device=device).unsqueeze(0).expand(bsz, -1)
+            position_ids[:, :fixed_cap_len, 0] = cap_range
+
             row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
             col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
 
-            for i in range(bsz):
-                cap_len = l_effective_cap_len[i]
-                position_ids[i, :cap_len, 0] = torch.arange(cap_len, dtype=torch.int32, device=device)
-                position_ids[i, cap_len:cap_len+img_len, 0] = cap_len
-                position_ids[i, cap_len:cap_len+img_len, 1] = row_ids
-                position_ids[i, cap_len:cap_len+img_len, 2] = col_ids
+            cap_len_tensor = cap_mask.sum(dim=1, keepdim=True)
+            position_ids[:, fixed_cap_len:, 0] = cap_len_tensor
+            position_ids[:, fixed_cap_len:, 1] = row_ids.unsqueeze(0).expand(bsz, -1)
+            position_ids[:, fixed_cap_len:, 2] = col_ids.unsqueeze(0).expand(bsz, -1)
 
             freqs_cis = self.rope_embedder(position_ids)
-
-            cap_freqs_cis = torch.zeros(bsz, cap_feats.shape[1], freqs_cis.shape[-1], device=device, dtype=freqs_cis.dtype)
-            img_freqs_cis = torch.zeros(bsz, img_len, freqs_cis.shape[-1], device=device, dtype=freqs_cis.dtype)
-            for i in range(bsz):
-                cap_len = l_effective_cap_len[i]
-                cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
-                img_freqs_cis[i] = freqs_cis[i, cap_len:cap_len+img_len]
+            cap_freqs_cis = freqs_cis[:, :fixed_cap_len]
+            img_freqs_cis = freqs_cis[:, fixed_cap_len:fixed_cap_len+img_len]
 
             for layer in self.context_refiner:
                 cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
@@ -781,13 +778,11 @@ class NextDiT(nn.Module):
             for layer in self.noise_refiner:
                 img_embed = layer(img_embed, img_mask, img_freqs_cis, t)
 
-            full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x_patches.dtype)
-            mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
-            for i in range(bsz):
-                cap_len = l_effective_cap_len[i]
-                mask[i, :cap_len+img_len] = True
-                full_embed[i, :cap_len] = cap_feats[i, :cap_len]
-                full_embed[i, cap_len:cap_len+img_len] = img_embed[i]
+            full_embed = torch.cat([cap_feats, img_embed], dim=1)
+
+            seq_range = torch.arange(max_seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            mask = (seq_range < fixed_cap_len) | ((seq_range >= fixed_cap_len) & (seq_range < fixed_cap_len + img_len))
+            mask = mask & torch.cat([cap_mask, img_mask], dim=1)
 
             return full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
 
