@@ -869,9 +869,17 @@ def main():
 
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(model, optimizer, train_dataloader, scheduler)
 
-    # Only prepare VAE and encoders if not using cache (they would be None if cache is enabled)
+    # Do NOT prepare encoders - they should stay frozen and not be wrapped
     if not use_cache:
-        vae, text_encoder, clip_model = accelerator.prepare(vae), accelerator.prepare(text_encoder), accelerator.prepare(clip_model)
+        vae = vae.to(accelerator.device)
+        text_encoder = text_encoder.to(accelerator.device)
+        clip_model = clip_model.to(accelerator.device)
+        vae.eval()
+        text_encoder.eval()
+        clip_model.eval()
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        clip_model.requires_grad_(False)
 
     start_step = load_checkpoint(accelerator, model, optimizer, scheduler, config)
 
