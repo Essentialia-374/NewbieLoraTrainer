@@ -292,10 +292,34 @@ class ImageCaptionDataset(Dataset):
 def collate_fn(batch):
     """数据批次处理函数"""
     if batch[0].get("cached", False):
+        max_seq_len = max(example["cap_feats"].shape[0] for example in batch)
+
+        padded_cap_feats = []
+        padded_cap_mask = []
+
+        for example in batch:
+            cap_feat = example["cap_feats"]
+            cap_mask = example["cap_mask"]
+            seq_len = cap_feat.shape[0]
+
+            if seq_len < max_seq_len:
+                padding_len = max_seq_len - seq_len
+                cap_feat = torch.cat([
+                    cap_feat,
+                    torch.zeros(padding_len, cap_feat.shape[1], dtype=cap_feat.dtype)
+                ], dim=0)
+                cap_mask = torch.cat([
+                    cap_mask,
+                    torch.zeros(padding_len, dtype=cap_mask.dtype)
+                ], dim=0)
+
+            padded_cap_feats.append(cap_feat)
+            padded_cap_mask.append(cap_mask)
+
         return {
             "latents": torch.stack([example["latents"] for example in batch]),
-            "cap_feats": torch.stack([example["cap_feats"] for example in batch]),
-            "cap_mask": torch.stack([example["cap_mask"] for example in batch]),
+            "cap_feats": torch.stack(padded_cap_feats),
+            "cap_mask": torch.stack(padded_cap_mask),
             "clip_text_pooled": torch.stack([example["clip_text_pooled"] for example in batch]),
             "cached": True,
         }
