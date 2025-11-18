@@ -115,6 +115,13 @@ class ImageCaptionDataset(Dataset):
     def _prepare_cache(self):
         from PIL import Image
         from tqdm import tqdm
+        try:
+            import cv2
+            import numpy as np
+            HAS_CV2 = True
+        except ImportError:
+            HAS_CV2 = False
+            logger.warning("OpenCV not available, WebP support may be limited")
 
         logger.info("Checking cache files...")
         missing_indices = []
@@ -146,7 +153,19 @@ class ImageCaptionDataset(Dataset):
                     text_cache = f"{os.path.splitext(image_path)[0]}.txt.safetensors"
 
                     try:
-                        image = Image.open(image_path).convert("RGB")
+                        try:
+                            image = Image.open(image_path).convert("RGB")
+                        except Exception as e:
+                            if HAS_CV2:
+                                logger.warning(f"PIL failed for {image_path}, using OpenCV")
+                                img_array = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                                if img_array is None:
+                                    raise ValueError(f"Cannot load: {image_path}")
+                                img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+                                image = Image.fromarray(img_array)
+                            else:
+                                raise e
+
                         pixel_values = transform(image).unsqueeze(0).to(self.device)
 
                         latents = self.vae.encode(pixel_values).latent_dist.mode()
@@ -226,12 +245,31 @@ class ImageCaptionDataset(Dataset):
             }
         else:
             from PIL import Image
+            try:
+                import cv2
+                import numpy as np
+                HAS_CV2 = True
+            except ImportError:
+                HAS_CV2 = False
 
             try:
                 image = Image.open(image_path).convert("RGB")
             except Exception as e:
-                logger.error(f"Failed to load {image_path}: {e}")
-                image = Image.new("RGB", (self.resolution, self.resolution), color="black")
+                if HAS_CV2:
+                    try:
+                        logger.warning(f"PIL failed for {image_path}, trying OpenCV")
+                        img_array = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                        if img_array is not None:
+                            img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+                            image = Image.fromarray(img_array)
+                        else:
+                            raise ValueError(f"OpenCV also failed to load {image_path}")
+                    except Exception as cv_err:
+                        logger.error(f"Both PIL and OpenCV failed for {image_path}: {e}, {cv_err}")
+                        image = Image.new("RGB", (self.resolution, self.resolution), color="black")
+                else:
+                    logger.error(f"Failed to load {image_path}: {e}")
+                    image = Image.new("RGB", (self.resolution, self.resolution), color="black")
 
             if self.enable_bucket:
                 orig_width, orig_height = image.size
