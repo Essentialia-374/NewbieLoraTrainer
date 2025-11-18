@@ -26,6 +26,7 @@ from diffusers.optimization import get_scheduler
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from peft import LoraConfig, get_peft_model, PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import load_file, save_file
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 import models
@@ -952,7 +953,12 @@ def main():
     max_grad_norm = config['Optimization'].get('gradient_clip_norm', 1.0)
 
     for epoch in range(config['Model']['num_epochs']):
-        for batch in train_dataloader:
+        progress_bar = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch+1}/{config['Model']['num_epochs']}",
+            disable=not accelerator.is_main_process
+        )
+        for batch in progress_bar:
             global_step += 1
 
             if global_step == 1 and args.profiler:
@@ -984,6 +990,14 @@ def main():
 
             if accelerator.is_main_process:
                 accelerator.log({"loss": loss.item(), "learning_rate": scheduler.get_last_lr()[0]}, step=global_step)
+
+                elapsed = datetime.now() - start_time
+                steps_per_sec = global_step / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'lr': f'{scheduler.get_last_lr()[0]:.2e}',
+                    'speed': f'{steps_per_sec:.2f} steps/s'
+                })
 
             if global_step % 100 == 0 or global_step == 1:
                 elapsed = datetime.now() - start_time
