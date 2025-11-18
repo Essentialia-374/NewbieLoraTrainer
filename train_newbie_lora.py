@@ -325,6 +325,83 @@ def load_encoders_only(config):
     return vae, text_encoder, tokenizer, clip_model, clip_tokenizer
 
 
+def load_transformer_only(config):
+    base_model_path = config['Model']['base_model_path']
+    trust_remote_code = config['Model'].get('trust_remote_code', True)
+    model_index_path = os.path.join(base_model_path, "model_index.json")
+    is_diffusers_format = os.path.exists(model_index_path)
+
+    mixed_precision = config['Model'].get('mixed_precision', 'no')
+    if mixed_precision == 'bf16':
+        model_dtype = torch.bfloat16
+    elif mixed_precision == 'fp16':
+        model_dtype = torch.float16
+    else:
+        model_dtype = torch.float32
+
+    logger.info(f"Loading transformer only from: {base_model_path}")
+
+    if is_diffusers_format:
+        transformer_path = os.path.join(base_model_path, "transformer")
+        config_path = os.path.join(transformer_path, "config.json")
+
+        with open(config_path, 'r') as f:
+            model_config = json.load(f)
+
+        text_encoder_path = os.path.join(base_model_path, "text_encoder")
+        text_encoder_config = AutoConfig.from_pretrained(text_encoder_path, trust_remote_code=trust_remote_code)
+        cap_feat_dim = text_encoder_config.text_config.hidden_size
+
+        model_name = model_config.get('_class_name', 'NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP')
+
+        model = models.__dict__[model_name](
+            in_channels=model_config.get('in_channels', 16),
+            qk_norm=True,
+            cap_feat_dim=cap_feat_dim,
+            clip_text_dim=model_config.get('clip_text_dim', 1024),
+            clip_img_dim=model_config.get('clip_img_dim', 1024),
+        )
+
+        weight_path = os.path.join(transformer_path, "diffusion_pytorch_model.safetensors")
+        if os.path.exists(weight_path):
+            state_dict = load_file(weight_path)
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                logger.warning(f"Missing keys: {len(missing_keys)}")
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys: {len(unexpected_keys)}")
+
+        if model_dtype != torch.float32:
+            model = model.to(dtype=model_dtype)
+            logger.info(f"Model converted to {model_dtype}")
+
+    else:
+        gemma_path = config['Model'].get('gemma_model_path', 'google/gemma-3-4b-it')
+
+        text_encoder_config = AutoConfig.from_pretrained(gemma_path, trust_remote_code=trust_remote_code)
+        cap_feat_dim = text_encoder_config.text_config.hidden_size
+
+        transformer_path = config['Model'].get('transformer_path', None)
+
+        model = models.NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP(
+            in_channels=16, qk_norm=True, cap_feat_dim=cap_feat_dim,
+            clip_text_dim=1024, clip_img_dim=1024
+        )
+
+        if transformer_path and os.path.exists(transformer_path):
+            state_dict = load_file(transformer_path) if transformer_path.endswith('.safetensors') else torch.load(transformer_path, map_location='cpu')
+            model.load_state_dict(state_dict, strict=False)
+
+        if model_dtype != torch.float32:
+            model = model.to(dtype=model_dtype)
+            logger.info(f"Model converted to {model_dtype}")
+
+    model.train()
+    logger.info(f"Transformer loaded: {model.parameter_count():,} params, cap_feat_dim={cap_feat_dim}")
+
+    return model
+
+
 def load_model_and_tokenizer(config):
     base_model_path = config['Model']['base_model_path']
     trust_remote_code = config['Model'].get('trust_remote_code', True)
@@ -692,7 +769,7 @@ def main():
             vae = text_encoder = tokenizer = clip_model = clip_tokenizer = None
 
         logger.info("Loading NextDiT model for training...")
-        model, _, _, _, _, _ = load_model_and_tokenizer(config)
+        model = load_transformer_only(config)
 
         dataset = ImageCaptionDataset(
             train_data_dir=train_data_dir,
