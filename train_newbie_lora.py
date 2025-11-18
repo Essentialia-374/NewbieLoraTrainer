@@ -423,10 +423,27 @@ class BucketBatchSampler:
 
 def collate_fn(batch):
     if batch[0].get("cached", False):
+        max_cap_len = max(example["cap_feats"].shape[0] for example in batch)
+
+        cap_feats_list = []
+        cap_mask_list = []
+        for example in batch:
+            cap_feat = example["cap_feats"]
+            cap_mask = example["cap_mask"]
+            current_len = cap_feat.shape[0]
+
+            if current_len < max_cap_len:
+                pad_len = max_cap_len - current_len
+                cap_feat = torch.cat([cap_feat, torch.zeros(pad_len, cap_feat.shape[1], dtype=cap_feat.dtype)], dim=0)
+                cap_mask = torch.cat([cap_mask, torch.zeros(pad_len, dtype=cap_mask.dtype)], dim=0)
+
+            cap_feats_list.append(cap_feat)
+            cap_mask_list.append(cap_mask)
+
         return {
             "latents": torch.stack([example["latents"] for example in batch]),
-            "cap_feats": torch.stack([example["cap_feats"] for example in batch]),
-            "cap_mask": torch.stack([example["cap_mask"] for example in batch]),
+            "cap_feats": torch.stack(cap_feats_list),
+            "cap_mask": torch.stack(cap_mask_list),
             "clip_text_pooled": torch.stack([example["clip_text_pooled"] for example in batch]),
             "cached": True,
         }
