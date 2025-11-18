@@ -622,6 +622,55 @@ def generate_noise(batch_size, num_channels, height, width, device):
     return torch.randn((batch_size, num_channels, height, width), device=device)
 
 
+def print_memory_usage(stage_name, profiler_enabled=False):
+    """打印显存使用情况"""
+    if not profiler_enabled:
+        return
+
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+
+        logger.info(f"=" * 80)
+        logger.info(f"GPU Memory at [{stage_name}]")
+        logger.info(f"  Allocated:     {allocated:.2f} GB")
+        logger.info(f"  Reserved:      {reserved:.2f} GB")
+        logger.info(f"  Max Allocated: {max_allocated:.2f} GB")
+        logger.info(f"=" * 80)
+
+
+def get_tensors_summary(profiler_enabled=False):
+    """获取所有 CUDA 张量的摘要"""
+    if not profiler_enabled or not torch.cuda.is_available():
+        return
+
+    import gc
+    tensors = []
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda:
+                tensors.append((type(obj).__name__, obj.size(), obj.dtype, obj.element_size() * obj.nelement() / 1024**2))
+        except:
+            pass
+
+    # 按大小排序
+    tensors.sort(key=lambda x: x[3], reverse=True)
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Top 20 Largest Tensors in GPU Memory:")
+    logger.info(f"{'Type':<20} {'Shape':<30} {'Dtype':<15} {'Size (MB)':<10}")
+    logger.info(f"{'-'*80}")
+
+    for i, (ttype, shape, dtype, size_mb) in enumerate(tensors[:20]):
+        logger.info(f"{ttype:<20} {str(shape):<30} {str(dtype):<15} {size_mb:>10.2f}")
+
+    total_size = sum(t[3] for t in tensors)
+    logger.info(f"{'-'*80}")
+    logger.info(f"Total tensor size: {total_size:.2f} MB ({len(tensors)} tensors)")
+    logger.info(f"{'='*80}\n")
+
+
 def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, device, gemma3_prompt=""):
     """计算 Rectified Flow 训练损失"""
     if batch.get("cached", False):
@@ -731,6 +780,7 @@ def main():
     """主训练函数"""
     parser = argparse.ArgumentParser(description="Newbie LoRA Trainer")
     parser.add_argument("--config_file", type=str, required=True, help="Path to .toml config file")
+    parser.add_argument("--profiler", action="store_true", help="Enable GPU memory profiling")
     args = parser.parse_args()
 
     with open(args.config_file, 'r', encoding='utf-8') as f:
@@ -806,6 +856,7 @@ def main():
 
         logger.info("Loading NextDiT model for training...")
         model = load_transformer_only(config)
+        print_memory_usage("After loading transformer", args.profiler)
 
         dataset = ImageCaptionDataset(
             train_data_dir=train_data_dir,
@@ -854,7 +905,9 @@ def main():
         model.gradient_checkpointing_enable()
         logger.info("Gradient checkpointing enabled")
 
+    print_memory_usage("Before LoRA", args.profiler)
     model = setup_lora(model, config)
+    print_memory_usage("After LoRA", args.profiler)
 
     train_dataloader = DataLoader(
         dataset,
@@ -867,7 +920,9 @@ def main():
     optimizer = setup_optimizer(model, config)
     scheduler, num_training_steps = setup_scheduler(optimizer, config, train_dataloader)
 
+    print_memory_usage("Before accelerator.prepare", args.profiler)
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(model, optimizer, train_dataloader, scheduler)
+    print_memory_usage("After accelerator.prepare", args.profiler)
 
     # Do NOT prepare encoders - they should stay frozen and not be wrapped
     if not use_cache:
@@ -880,8 +935,12 @@ def main():
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
         clip_model.requires_grad_(False)
+        print_memory_usage("After loading encoders (no cache)", args.profiler)
 
     start_step = load_checkpoint(accelerator, model, optimizer, scheduler, config)
+
+    if args.profiler:
+        get_tensors_summary(args.profiler)
 
     logger.info("Training started")
     global_step = start_step
@@ -896,9 +955,18 @@ def main():
         for batch in train_dataloader:
             global_step += 1
 
+            if global_step == 1 and args.profiler:
+                print_memory_usage("Before first forward pass", args.profiler)
+
             loss = compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, accelerator.device, gemma3_prompt)
 
+            if global_step == 1 and args.profiler:
+                print_memory_usage("After first forward pass", args.profiler)
+
             accelerator.backward(loss)
+
+            if global_step == 1 and args.profiler:
+                print_memory_usage("After first backward pass", args.profiler)
 
             if max_grad_norm > 0:
                 accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -906,6 +974,13 @@ def main():
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+
+            if global_step == 1 and args.profiler:
+                print_memory_usage("After first optimizer step", args.profiler)
+                get_tensors_summary(args.profiler)
+                logger.info("Profiling complete for first step. You can now Ctrl+C to stop.")
+                import sys
+                sys.exit(0)
 
             if accelerator.is_main_process:
                 accelerator.log({"loss": loss.item(), "learning_rate": scheduler.get_last_lr()[0]}, step=global_step)
