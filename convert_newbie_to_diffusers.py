@@ -242,7 +242,7 @@ def convert_to_diffusers(
         "axes_lens": [1024, 512, 512],
         "clip_text_dim": 1024,
         "clip_img_dim": 1024,
-        "_class_name": "NextDiT_CLIP",
+        "_class_name": "NextDiT_3B_GQA_patch2_Adaln_Refiner_WHIT_CLIP",
     }
 
     with open(dit_path / "config.json", "w") as f:
