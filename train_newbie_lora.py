@@ -58,6 +58,9 @@ class ImageCaptionDataset(Dataset):
         device=None,
         dtype=torch.bfloat16,
         gemma3_prompt: str = "",
+        min_bucket_reso: int = 256,
+        max_bucket_reso: int = 2048,
+        bucket_reso_step: int = 64,
     ):
         self.train_data_dir = train_data_dir
         self.resolution = resolution
@@ -66,8 +69,10 @@ class ImageCaptionDataset(Dataset):
         self.image_paths = []
         self.captions = []
         self.repeats = []
-        self.expanded_indices = []
+        self.image_resolutions = []
         self.buckets = {}
+        self.bucket_resolutions = []
+        self.image_to_bucket = {}
         self.image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'}
 
         self.vae = vae
@@ -78,17 +83,25 @@ class ImageCaptionDataset(Dataset):
         self.device = device
         self.dtype = dtype
         self.gemma3_prompt = gemma3_prompt
+        self.min_bucket_reso = min_bucket_reso
+        self.max_bucket_reso = max_bucket_reso
+        self.bucket_reso_step = bucket_reso_step
 
         self._load_data()
         if self.enable_bucket:
-            self._prepare_buckets()
+            self._generate_buckets()
+            self._assign_buckets()
+        else:
+            for idx in range(len(self.image_paths)):
+                self.image_to_bucket[idx] = (self.resolution, self.resolution)
 
         if self.use_cache and vae is not None:
             self._prepare_cache()
 
     def _load_data(self):
+        from PIL import Image
         logger.info(f"Loading data from: {self.train_data_dir}")
-        
+
         for root, _, files in os.walk(self.train_data_dir):
             dir_name = os.path.basename(root)
             repeats = int(dir_name.split('_')[0]) if '_' in dir_name and dir_name[0].isdigit() else 1
@@ -108,14 +121,19 @@ class ImageCaptionDataset(Dataset):
                             with open(caption_path, 'r', encoding='latin-1') as f:
                                 caption = f.read().strip()
 
+                    try:
+                        with Image.open(image_path) as img:
+                            width, height = img.size
+                            self.image_resolutions.append((width, height))
+                    except Exception as e:
+                        logger.warning(f"Could not read image size for {image_path}: {e}")
+                        self.image_resolutions.append((self.resolution, self.resolution))
+
                     self.image_paths.append(image_path)
                     self.captions.append(caption)
                     self.repeats.append(repeats)
 
-        for idx, repeat in enumerate(self.repeats):
-            self.expanded_indices.extend([idx] * repeat)
-
-        logger.info(f"Loaded {len(self.image_paths)} unique images with {len(self.expanded_indices)} total samples (including repeats)")
+        logger.info(f"Loaded {len(self.image_paths)} unique images")
 
     def _prepare_cache(self):
         from PIL import Image
@@ -144,12 +162,6 @@ class ImageCaptionDataset(Dataset):
             self.text_encoder.eval().to(self.device)
             self.clip_model.eval().to(self.device)
 
-            transform = transforms.Compose([
-                transforms.Resize((self.resolution, self.resolution), interpolation=InterpolationMode.LANCZOS),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5])
-            ])
-
             with torch.no_grad():
                 for idx in tqdm(missing_indices, desc="Caching"):
                     image_path = self.image_paths[idx]
@@ -171,12 +183,37 @@ class ImageCaptionDataset(Dataset):
                             else:
                                 raise e
 
+                        bucket_reso = self.image_to_bucket.get(idx, (self.resolution, self.resolution))
+                        target_width, target_height = bucket_reso
+
+                        bucket_ratio = target_width / target_height
+                        orig_ratio = image.size[0] / image.size[1]
+
+                        if orig_ratio > bucket_ratio:
+                            resize_height = target_height
+                            resize_width = int(resize_height * orig_ratio)
+                        else:
+                            resize_width = target_width
+                            resize_height = int(resize_width / orig_ratio)
+
+                        transform = transforms.Compose([
+                            transforms.Resize((resize_height, resize_width), interpolation=InterpolationMode.LANCZOS),
+                            transforms.CenterCrop((target_height, target_width)),
+                            transforms.ToTensor(),
+                            transforms.Normalize([0.5], [0.5])
+                        ])
+
                         pixel_values = transform(image).unsqueeze(0).to(self.device)
 
                         latents = self.vae.encode(pixel_values).latent_dist.mode()
                         scaling_factor = getattr(self.vae.config, 'scaling_factor', 0.13025)
                         latents = (latents * scaling_factor).squeeze(0).cpu()
-                        save_file({"latents": latents}, vae_cache)
+
+                        save_file({
+                            "latents": latents,
+                            "width": torch.tensor(target_width),
+                            "height": torch.tensor(target_height)
+                        }, vae_cache)
 
                         with torch.autocast(device_type='cuda', dtype=self.dtype):
                             gemma_text = self.gemma3_prompt + caption if self.gemma3_prompt else caption
@@ -207,33 +244,69 @@ class ImageCaptionDataset(Dataset):
         else:
             logger.info("All cache files found")
 
-    def _prepare_buckets(self):
-        """创建多宽高比分辨率桶"""
-        aspect_ratios = [(1, 1), (3, 4), (4, 3), (9, 16), (16, 9)]
-        buckets = []
+    def _generate_buckets(self):
+        max_reso = self.resolution
+        max_tokens = (max_reso / 16) * (max_reso / 16)
 
-        for ar in aspect_ratios:
-            width = int(self.resolution * ar[0] / max(ar))
-            height = int(self.resolution * ar[1] / max(ar))
-            width = (width // 64) * 64  # 对齐64
-            height = (height // 64) * 64
-            buckets.append((width, height))
+        assert self.bucket_reso_step % 64 == 0, "bucket_reso_step must be divisible by 64"
+        assert self.min_bucket_reso % 64 == 0, "min_bucket_reso must be divisible by 64"
+        assert self.max_bucket_reso % 64 == 0, "max_bucket_reso must be divisible by 64"
 
-        buckets = list(set(buckets))
-        buckets.sort(key=lambda x: x[0] * x[1])
+        resolutions = set()
 
-        for bucket in buckets:
-            self.buckets[bucket] = []
+        w = self.min_bucket_reso
+        while w <= self.max_bucket_reso:
+            h = self.min_bucket_reso
+            while h <= self.max_bucket_reso:
+                if (w / 16) * (h / 16) <= max_tokens and w % 64 == 0 and h % 64 == 0:
+                    resolutions.add((w, h))
+                h += self.bucket_reso_step
+            w += self.bucket_reso_step
 
-        logger.info(f"Created {len(buckets)} resolution buckets: {buckets}")
+        self.bucket_resolutions = sorted(list(resolutions), key=lambda x: x[0] / x[1])
+
+        for reso in self.bucket_resolutions:
+            self.buckets[reso] = []
+
+        logger.info(f"Generated {len(self.bucket_resolutions)} buckets with max {max_tokens:.0f} tokens")
+        logger.info(f"Example buckets: {self.bucket_resolutions[:5]} ... {self.bucket_resolutions[-5:]}")
+
+    def _assign_buckets(self):
+        skipped = 0
+
+        for idx, (img_w, img_h) in enumerate(self.image_resolutions):
+            aspect_ratio = img_w / img_h
+
+            closest_bucket = min(
+                self.bucket_resolutions,
+                key=lambda x: abs((x[0] / x[1]) - aspect_ratio)
+            )
+
+            bucket_ar = closest_bucket[0] / closest_bucket[1]
+            ar_error = abs(bucket_ar - aspect_ratio)
+
+            if ar_error < 0.5:
+                self.buckets[closest_bucket].append(idx)
+                self.image_to_bucket[idx] = closest_bucket
+            else:
+                skipped += 1
+                default_bucket = (self.resolution, self.resolution)
+                if default_bucket in self.buckets:
+                    self.buckets[default_bucket].append(idx)
+                    self.image_to_bucket[idx] = default_bucket
+
+        bucket_info = {k: len(v) for k, v in self.buckets.items() if len(v) > 0}
+        logger.info(f"Bucket assignment: {bucket_info}")
+        if skipped > 0:
+            logger.info(f"Skipped {skipped} images with extreme aspect ratios")
     
     def __len__(self):
-        return len(self.expanded_indices)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        actual_idx = self.expanded_indices[idx]
-        image_path = self.image_paths[actual_idx]
-        caption = self.captions[actual_idx]
+        image_path = self.image_paths[idx]
+        caption = self.captions[idx]
+        bucket_reso = self.image_to_bucket.get(idx, (self.resolution, self.resolution))
 
         if self.use_cache:
             vae_cache = f"{image_path}.safetensors"
@@ -277,16 +350,21 @@ class ImageCaptionDataset(Dataset):
                     logger.error(f"Failed to load {image_path}: {e}")
                     image = Image.new("RGB", (self.resolution, self.resolution), color="black")
 
-            if self.enable_bucket:
-                orig_width, orig_height = image.size
-                orig_ratio = orig_width / orig_height
-                closest_bucket = min(self.buckets.keys(), key=lambda x: abs((x[0] / x[1]) - orig_ratio))
-                target_width, target_height = closest_bucket
+            target_width, target_height = bucket_reso
+
+            bucket_ratio = target_width / target_height
+            orig_ratio = image.size[0] / image.size[1]
+
+            if orig_ratio > bucket_ratio:
+                resize_height = target_height
+                resize_width = int(resize_height * orig_ratio)
             else:
-                target_width = target_height = self.resolution
+                resize_width = target_width
+                resize_height = int(resize_width / orig_ratio)
 
             transform = transforms.Compose([
-                transforms.Resize((target_height, target_width), interpolation=InterpolationMode.LANCZOS),
+                transforms.Resize((resize_height, resize_width), interpolation=InterpolationMode.LANCZOS),
+                transforms.CenterCrop((target_height, target_width)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5])
             ])
@@ -294,8 +372,56 @@ class ImageCaptionDataset(Dataset):
             return {"pixel_values": transform(image), "caption": caption, "cached": False}
 
 
+class BucketBatchSampler:
+    def __init__(self, dataset, batch_size, shuffle=True, seed=42):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+        self.bucket_to_indices = {}
+        for idx in range(len(dataset)):
+            bucket_reso = dataset.image_to_bucket.get(idx, (dataset.resolution, dataset.resolution))
+            if bucket_reso not in self.bucket_to_indices:
+                self.bucket_to_indices[bucket_reso] = []
+
+            for _ in range(dataset.repeats[idx]):
+                self.bucket_to_indices[bucket_reso].append(idx)
+
+        self.available_buckets = [k for k, v in self.bucket_to_indices.items() if len(v) >= batch_size]
+
+        total_batches = sum(len(indices) // batch_size for indices in self.bucket_to_indices.values())
+        logger.info(f"BucketBatchSampler: {len(self.available_buckets)} buckets, {total_batches} batches")
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+
+        bucket_batches = []
+        for bucket_reso, indices in self.bucket_to_indices.items():
+            indices_copy = indices.copy()
+            if self.shuffle:
+                rng.shuffle(indices_copy)
+
+            for i in range(0, len(indices_copy), self.batch_size):
+                batch = indices_copy[i:i + self.batch_size]
+                if len(batch) == self.batch_size:
+                    bucket_batches.append(batch)
+
+        if self.shuffle:
+            rng.shuffle(bucket_batches)
+
+        for batch in bucket_batches:
+            yield batch
+
+    def __len__(self):
+        return sum(len(indices) // self.batch_size for indices in self.bucket_to_indices.values())
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+
 def collate_fn(batch):
-    """数据批次处理函数"""
     if batch[0].get("cached", False):
         max_seq_len = max(example["cap_feats"].shape[0] for example in batch)
 
@@ -939,16 +1065,30 @@ def main():
     print_memory_usage("After LoRA", args.profiler)
 
     num_workers = config['Model'].get('dataloader_num_workers', 4)
-    train_dataloader = DataLoader(
-        dataset,
-        batch_size=config['Model']['train_batch_size'],
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else None
-    )
+    batch_size = config['Model']['train_batch_size']
+
+    if config['Model'].get('enable_bucket', True):
+        batch_sampler = BucketBatchSampler(dataset, batch_size=batch_size, shuffle=True, seed=42)
+        train_dataloader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
+    else:
+        train_dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
 
     optimizer = setup_optimizer(model, config)
     scheduler, num_training_steps = setup_scheduler(optimizer, config, train_dataloader)
@@ -994,6 +1134,10 @@ def main():
         logger.info(f"Resuming from epoch {start_epoch+1}, will skip {steps_to_skip_in_first_epoch} steps in first epoch")
 
     for epoch in range(start_epoch, config['Model']['num_epochs']):
+        if config['Model'].get('enable_bucket', True) and hasattr(train_dataloader, 'batch_sampler'):
+            if hasattr(train_dataloader.batch_sampler, 'set_epoch'):
+                train_dataloader.batch_sampler.set_epoch(epoch)
+
         epoch_losses = []
         progress_bar = tqdm(
             train_dataloader,
