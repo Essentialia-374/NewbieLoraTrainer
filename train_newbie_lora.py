@@ -933,12 +933,16 @@ def main():
     model = setup_lora(model, config)
     print_memory_usage("After LoRA", args.profiler)
 
+    num_workers = config['Model'].get('dataloader_num_workers', 4)
     train_dataloader = DataLoader(
         dataset,
         batch_size=config['Model']['train_batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     )
 
     optimizer = setup_optimizer(model, config)
