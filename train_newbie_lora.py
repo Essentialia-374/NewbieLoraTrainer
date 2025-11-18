@@ -25,7 +25,7 @@ from diffusers import AutoencoderKL
 from diffusers.optimization import get_scheduler
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from peft import LoraConfig, get_peft_model, PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, str(Path(__file__).parent))
 import models
@@ -43,19 +43,46 @@ logger = logging.getLogger("newbie_lora_trainer")
 class ImageCaptionDataset(Dataset):
     """图像-文本对数据集，支持 kohya_ss 风格目录重复"""
 
-    def __init__(self, train_data_dir: str, resolution: int, enable_bucket: bool = True):
+    def __init__(
+        self,
+        train_data_dir: str,
+        resolution: int,
+        enable_bucket: bool = True,
+        use_cache: bool = True,
+        vae=None,
+        text_encoder=None,
+        tokenizer=None,
+        clip_model=None,
+        clip_tokenizer=None,
+        device=None,
+        dtype=torch.bfloat16,
+        gemma3_prompt: str = "",
+    ):
         self.train_data_dir = train_data_dir
         self.resolution = resolution
         self.enable_bucket = enable_bucket
+        self.use_cache = use_cache
         self.image_paths = []
         self.captions = []
         self.repeats = []
         self.buckets = {}
         self.image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'}
 
+        self.vae = vae
+        self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
+        self.clip_model = clip_model
+        self.clip_tokenizer = clip_tokenizer
+        self.device = device
+        self.dtype = dtype
+        self.gemma3_prompt = gemma3_prompt
+
         self._load_data()
         if self.enable_bucket:
             self._prepare_buckets()
+
+        if self.use_cache and vae is not None:
+            self._prepare_cache()
 
     def _load_data(self):
         logger.info(f"Loading data from: {self.train_data_dir}")
@@ -84,7 +111,78 @@ class ImageCaptionDataset(Dataset):
                     self.repeats.append(repeats)
 
         logger.info(f"Loaded {len(self.image_paths)} image-caption pairs")
-    
+
+    def _prepare_cache(self):
+        from PIL import Image
+        from tqdm import tqdm
+
+        logger.info("Checking cache files...")
+        missing_indices = []
+
+        for idx, image_path in enumerate(self.image_paths):
+            vae_cache = f"{image_path}.safetensors"
+            text_cache = f"{os.path.splitext(image_path)[0]}.txt.safetensors"
+
+            if not os.path.exists(vae_cache) or not os.path.exists(text_cache):
+                missing_indices.append(idx)
+
+        if missing_indices:
+            logger.info(f"Generating {len(missing_indices)} cache files...")
+            self.vae.eval().to(self.device)
+            self.text_encoder.eval().to(self.device)
+            self.clip_model.eval().to(self.device)
+
+            transform = transforms.Compose([
+                transforms.Resize((self.resolution, self.resolution), interpolation=InterpolationMode.LANCZOS),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+
+            with torch.no_grad():
+                for idx in tqdm(missing_indices, desc="Caching"):
+                    image_path = self.image_paths[idx]
+                    caption = self.captions[idx]
+                    vae_cache = f"{image_path}.safetensors"
+                    text_cache = f"{os.path.splitext(image_path)[0]}.txt.safetensors"
+
+                    try:
+                        image = Image.open(image_path).convert("RGB")
+                        pixel_values = transform(image).unsqueeze(0).to(self.device)
+
+                        latents = self.vae.encode(pixel_values).latent_dist.mode()
+                        scaling_factor = getattr(self.vae.config, 'scaling_factor', 0.13025)
+                        latents = (latents * scaling_factor).squeeze(0).cpu()
+                        save_file({"latents": latents}, vae_cache)
+
+                        with torch.autocast(device_type='cuda', dtype=self.dtype):
+                            gemma_text = self.gemma3_prompt + caption if self.gemma3_prompt else caption
+                            gemma_inputs = self.tokenizer(
+                                [gemma_text], padding=True, pad_to_multiple_of=8,
+                                truncation=True, max_length=512, return_tensors="pt"
+                            ).to(self.device)
+                            gemma_outputs = self.text_encoder(**gemma_inputs, output_hidden_states=True)
+                            cap_feats = gemma_outputs.hidden_states[-2].squeeze(0).cpu()
+                            cap_mask = gemma_inputs.attention_mask.squeeze(0).cpu()
+
+                            clip_inputs = self.clip_tokenizer(
+                                [caption], padding=True, truncation=True,
+                                max_length=2048, return_tensors="pt"
+                            ).to(self.device)
+                            clip_text_pooled = self.clip_model.get_text_features(**clip_inputs).squeeze(0).cpu()
+
+                        save_file({
+                            "cap_feats": cap_feats,
+                            "cap_mask": cap_mask,
+                            "clip_text_pooled": clip_text_pooled
+                        }, text_cache)
+
+                    except Exception as e:
+                        logger.error(f"Cache error for {image_path}: {e}")
+
+            logger.info("Cache generation complete")
+        else:
+            logger.info("All cache files found")
+
     def _prepare_buckets(self):
         """创建多宽高比分辨率桶"""
         aspect_ratios = [(1, 1), (3, 4), (4, 3), (9, 16), (16, 9)]
@@ -109,43 +207,65 @@ class ImageCaptionDataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        from PIL import Image
-
         image_path = self.image_paths[idx]
         caption = self.captions[idx]
 
-        try:
-            image = Image.open(image_path).convert("RGB")
-        except Exception as e:
-            logger.error(f"Failed to load {image_path}: {e}")
-            image = Image.new("RGB", (self.resolution, self.resolution), color="black")
+        if self.use_cache:
+            vae_cache = f"{image_path}.safetensors"
+            text_cache = f"{os.path.splitext(image_path)[0]}.txt.safetensors"
 
-        if self.enable_bucket:
-            orig_width, orig_height = image.size
-            orig_ratio = orig_width / orig_height
-            closest_bucket = min(self.buckets.keys(), key=lambda x: abs((x[0] / x[1]) - orig_ratio))
-            target_width, target_height = closest_bucket
+            vae_data = load_file(vae_cache)
+            text_data = load_file(text_cache)
+
+            return {
+                "latents": vae_data['latents'],
+                "cap_feats": text_data['cap_feats'],
+                "cap_mask": text_data['cap_mask'],
+                "clip_text_pooled": text_data['clip_text_pooled'],
+                "cached": True,
+            }
         else:
-            target_width = target_height = self.resolution
+            from PIL import Image
 
-        transform = transforms.Compose([
-            transforms.Resize((target_height, target_width), interpolation=InterpolationMode.LANCZOS),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ])
+            try:
+                image = Image.open(image_path).convert("RGB")
+            except Exception as e:
+                logger.error(f"Failed to load {image_path}: {e}")
+                image = Image.new("RGB", (self.resolution, self.resolution), color="black")
 
-        return {"pixel_values": transform(image), "caption": caption}
+            if self.enable_bucket:
+                orig_width, orig_height = image.size
+                orig_ratio = orig_width / orig_height
+                closest_bucket = min(self.buckets.keys(), key=lambda x: abs((x[0] / x[1]) - orig_ratio))
+                target_width, target_height = closest_bucket
+            else:
+                target_width = target_height = self.resolution
+
+            transform = transforms.Compose([
+                transforms.Resize((target_height, target_width), interpolation=InterpolationMode.LANCZOS),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+
+            return {"pixel_values": transform(image), "caption": caption, "cached": False}
 
 
 def collate_fn(batch):
     """数据批次处理函数"""
-    pixel_values = torch.stack([example["pixel_values"] for example in batch])
-    captions = [example["caption"] for example in batch]
-    
-    return {
-        "pixel_values": pixel_values,
-        "captions": captions
-    }
+    if batch[0].get("cached", False):
+        return {
+            "latents": torch.stack([example["latents"] for example in batch]),
+            "cap_feats": torch.stack([example["cap_feats"] for example in batch]),
+            "cap_mask": torch.stack([example["cap_mask"] for example in batch]),
+            "clip_text_pooled": torch.stack([example["clip_text_pooled"] for example in batch]),
+            "cached": True,
+        }
+    else:
+        return {
+            "pixel_values": torch.stack([example["pixel_values"] for example in batch]),
+            "captions": [example["caption"] for example in batch],
+            "cached": False,
+        }
 
 
 def load_model_and_tokenizer(config):
@@ -326,36 +446,45 @@ def generate_noise(batch_size, num_channels, height, width, device):
 
 def compute_loss(model, vae, text_encoder, tokenizer, clip_model, clip_tokenizer, transport, batch, device):
     """计算 Rectified Flow 训练损失"""
-    pixel_values = batch["pixel_values"].to(device)
-    captions = batch["captions"]
-    batch_size = pixel_values.shape[0]
+    if batch.get("cached", False):
+        latents = batch["latents"].to(device)
+        cap_feats = batch["cap_feats"].to(device)
+        cap_mask = batch["cap_mask"].to(device)
+        clip_text_pooled = batch["clip_text_pooled"].to(device)
+        batch_size = latents.shape[0]
+    else:
+        if vae is None or text_encoder is None or clip_model is None:
+            raise RuntimeError("Models required for non-cached data but they are None. Enable cache or disable it in config.")
 
-    with torch.no_grad():
-        # Gemma3: 主文本特征 (max_length=512, 使用倒数第二层)
-        gemma_inputs = tokenizer(
-            captions, padding=True, pad_to_multiple_of=8,
-            truncation=True, max_length=512, return_tensors="pt"
-        ).to(device)
-        gemma_outputs = text_encoder(**gemma_inputs, output_hidden_states=True)
-        cap_feats = gemma_outputs.hidden_states[-2]
-        cap_mask = gemma_inputs.attention_mask
+        pixel_values = batch["pixel_values"].to(device)
+        captions = batch["captions"]
+        batch_size = pixel_values.shape[0]
 
-        # Jina CLIP: 池化文本特征 (max_length=2048)
-        clip_inputs = clip_tokenizer(
-            captions, padding=True, truncation=True,
-            max_length=2048, return_tensors="pt"
-        ).to(device)
-        clip_text_pooled = clip_model.get_text_features(**clip_inputs)
+        gemma3_prompt = config['Model'].get('gemma3_prompt', '')
 
-        # VAE 编码
-        latents = vae.encode(pixel_values).latent_dist.sample()
-        scaling_factor = getattr(vae.config, 'scaling_factor', 0.13025)
-        latents = latents * scaling_factor
+        with torch.no_grad():
+            gemma_texts = [gemma3_prompt + cap if gemma3_prompt else cap for cap in captions]
+            gemma_inputs = tokenizer(
+                gemma_texts, padding=True, pad_to_multiple_of=8,
+                truncation=True, max_length=512, return_tensors="pt"
+            ).to(device)
+            gemma_outputs = text_encoder(**gemma_inputs, output_hidden_states=True)
+            cap_feats = gemma_outputs.hidden_states[-2]
+            cap_mask = gemma_inputs.attention_mask
+
+            clip_inputs = clip_tokenizer(
+                captions, padding=True, truncation=True,
+                max_length=2048, return_tensors="pt"
+            ).to(device)
+            clip_text_pooled = clip_model.get_text_features(**clip_inputs)
+
+            latents = vae.encode(pixel_values).latent_dist.sample()
+            scaling_factor = getattr(vae.config, 'scaling_factor', 0.13025)
+            latents = latents * scaling_factor
 
     latents_list = [latents[i] for i in range(batch_size)]
     model_kwargs = dict(cap_feats=cap_feats, cap_mask=cap_mask, clip_text_pooled=clip_text_pooled)
 
-    # Rectified Flow 损失计算
     loss_dict = transport.training_losses(model, latents_list, model_kwargs)
     return loss_dict["loss"].mean()
 
@@ -467,11 +596,33 @@ def main():
         model.gradient_checkpointing_enable()
         logger.info("Gradient checkpointing enabled")
 
+    use_cache = config['Model'].get('use_cache', True)
+    mixed_precision = config['Model'].get('mixed_precision', 'no')
+    cache_dtype = torch.bfloat16 if mixed_precision == 'bf16' else (torch.float16 if mixed_precision == 'fp16' else torch.float32)
+    gemma3_prompt = config['Model'].get('gemma3_prompt', '')
+
     dataset = ImageCaptionDataset(
         train_data_dir=config['Model']['train_data_dir'],
         resolution=resolution,
-        enable_bucket=config['Model'].get('enable_bucket', True)
+        enable_bucket=config['Model'].get('enable_bucket', True),
+        use_cache=use_cache,
+        vae=vae if use_cache else None,
+        text_encoder=text_encoder if use_cache else None,
+        tokenizer=tokenizer if use_cache else None,
+        clip_model=clip_model if use_cache else None,
+        clip_tokenizer=clip_tokenizer if use_cache else None,
+        device=accelerator.device,
+        dtype=cache_dtype,
+        gemma3_prompt=gemma3_prompt,
     )
+
+    if use_cache:
+        logger.info("Cache enabled, freeing VAE, text_encoder and clip_model from GPU")
+        del vae, text_encoder, clip_model
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        vae = text_encoder = clip_model = None
 
     train_dataloader = DataLoader(
         dataset,

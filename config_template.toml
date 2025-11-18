@@ -57,6 +57,15 @@ resolution = 1024
 # false: 所有图像都调整为正方形（resolution × resolution）
 enable_bucket = true
 
+# 启用数据缓存（推荐）
+# true: 预先缓存 VAE latents 和文本特征，大幅加速训练并节省显存
+# false: 每次实时编码（慢，但不占用磁盘空间）
+# 缓存文件保存在数据集同目录：图片.safetensors, 文本.txt.safetensors
+use_cache = true
+
+# Gemma3 系统提示词（仅用于 Gemma3，不影响 Jina CLIP）
+gemma3_prompt = "You are an assistant designed to generate high-quality anime images with the highest degree of image-text alignment based on textual prompts. <Prompt Start>"
+
 # =============================================================================
 # 训练超参数
 # =============================================================================
