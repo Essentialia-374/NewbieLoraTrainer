@@ -46,6 +46,183 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("newbie_lora_trainer")
 
 
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'}
+
+
+def load_dataset_json_mapping(train_data_dir: str) -> Optional[Dict[str, str]]:
+    """
+    If <train_data_dir>/dataset.json exists, load it as:
+      { "image_name_or_relpath.png": "prompt", ... }
+    Returns None if dataset.json doesn't exist.
+    """
+    dataset_json_path = os.path.join(train_data_dir, "dataset.json")
+    if not os.path.isfile(dataset_json_path):
+        return None
+
+    try:
+        # utf-8-sig handles BOM if present
+        with open(dataset_json_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read dataset.json: {dataset_json_path} ({e})")
+
+    if not isinstance(data, dict):
+        raise ValueError("dataset.json must be a JSON object mapping {filename: prompt, ...}")
+
+    out: Dict[str, str] = {}
+    for k, v in data.items():
+        key = str(k)
+        prompt = "" if v is None else str(v)
+        out[key] = prompt
+    return out
+
+
+def _index_images(root: Path, image_extensions: set) -> Tuple[Dict[str, Path], Dict[str, List[Path]]]:
+    """
+    Build indices for case-insensitive lookup:
+      - rel_index: "subdir/file.png" (lower) -> Path
+      - name_index: "file.png" (lower) -> [Path, ...]
+    """
+    rel_index: Dict[str, Path] = {}
+    name_index: Dict[str, List[Path]] = {}
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in image_extensions:
+            continue
+        rel = p.relative_to(root).as_posix()
+        rel_index[rel.lower()] = p
+        name_index.setdefault(p.name.lower(), []).append(p)
+    return rel_index, name_index
+
+
+def resolve_dataset_json_entries(
+    train_data_dir: str,
+    mapping: Dict[str, str],
+    image_extensions: set,
+) -> Tuple[List[Tuple[str, str]], int]:
+    """
+    Resolve dataset.json keys to actual image paths under train_data_dir.
+    Returns ([(abs_image_path, prompt), ...], skipped_count)
+    """
+    root = Path(train_data_dir).resolve()
+    pairs: List[Tuple[str, str]] = []
+    skipped = 0
+
+    rel_index = None
+    name_index = None
+
+    def ensure_indices():
+        nonlocal rel_index, name_index
+        if rel_index is None or name_index is None:
+            rel_index, name_index = _index_images(root, image_extensions)
+
+    for raw_key, prompt in mapping.items():
+        key = str(raw_key).strip().replace("\\", "/").lstrip("/")
+        if not key:
+            logger.warning("dataset.json contains an empty key; skipping")
+            skipped += 1
+            continue
+
+        rel = Path(key)
+        if rel.is_absolute():
+            logger.warning(f"dataset.json key is an absolute path (not allowed): {raw_key!r}; skipping")
+            skipped += 1
+            continue
+
+        # 1) Try direct path under root (exact case)
+        candidate = root / rel
+        resolved: Optional[Path] = None
+
+        if candidate.suffix:
+            if candidate.suffix.lower() not in image_extensions:
+                logger.warning(f"dataset.json entry is not an image (ext={candidate.suffix}): {raw_key!r}; skipping")
+                skipped += 1
+                continue
+            if candidate.exists():
+                resolved = candidate
+        else:
+            # key has no extension -> try common extensions
+            for ext in sorted(image_extensions):
+                cand2 = candidate.with_suffix(ext)
+                if cand2.exists():
+                    resolved = cand2
+                    break
+
+        # 2) Case-insensitive / fallback lookups
+        if resolved is None:
+            ensure_indices()
+            # try relpath match (case-insensitive)
+            rel_norm = rel.as_posix().lower()
+            if rel_norm in rel_index:
+                resolved = rel_index[rel_norm]
+            else:
+                # try basename match (case-insensitive)
+                basename = rel.name.lower()
+                if basename in name_index:
+                    paths = name_index[basename]
+                    if len(paths) > 1:
+                        logger.warning(
+                            f"dataset.json key {raw_key!r} matches multiple files; using the first: "
+                            f"{paths[0].relative_to(root).as_posix()}"
+                        )
+                    resolved = paths[0]
+                elif rel.suffix == "":
+                    # key had no suffix; try stem + any extension by basename
+                    for ext in sorted(image_extensions):
+                        cand_name = f"{rel.name}{ext}".lower()
+                        if cand_name in name_index:
+                            paths = name_index[cand_name]
+                            if len(paths) > 1:
+                                logger.warning(
+                                    f"dataset.json key {raw_key!r} matches multiple files; using the first: "
+                                    f"{paths[0].relative_to(root).as_posix()}"
+                                )
+                            resolved = paths[0]
+                            break
+
+        if resolved is None:
+            logger.warning(f"dataset.json entry points to missing image: {raw_key!r}; skipping")
+            skipped += 1
+            continue
+
+        # 3) Safety: disallow escaping train_data_dir
+        try:
+            resolved_abs = resolved.resolve()
+            if not resolved_abs.is_relative_to(root):
+                logger.warning(f"dataset.json entry escapes train_data_dir: {raw_key!r} -> {str(resolved_abs)}; skipping")
+                skipped += 1
+                continue
+        except Exception:
+            resolved_abs = resolved
+
+        pairs.append((str(resolved_abs), ("" if prompt is None else str(prompt)).strip()))
+
+    return pairs, skipped
+
+
+def get_training_image_paths(train_data_dir: str, image_extensions: set) -> List[str]:
+    """
+    Used by cache pre-check to ensure the same image set as the Dataset.
+    - If dataset.json exists: images are exactly the keys in dataset.json (resolved under the folder).
+    - Else: fallback to existing kohya-style directory walk.
+    """
+    mapping = load_dataset_json_mapping(train_data_dir)
+    if mapping is not None:
+        pairs, skipped = resolve_dataset_json_entries(train_data_dir, mapping, image_extensions)
+        if skipped:
+            logger.warning(f"Skipped {skipped} dataset.json entries due to missing/invalid images")
+        return [p for (p, _cap) in pairs]
+
+    image_paths: List[str] = []
+    for root, _, files in os.walk(train_data_dir):
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in image_extensions:
+                image_paths.append(os.path.join(root, file))
+    return image_paths
+
+
 class ImageCaptionDataset(Dataset):
     """图像-文本对数据集，支持 kohya_ss 风格目录重复"""
 
@@ -106,37 +283,28 @@ class ImageCaptionDataset(Dataset):
     def _load_data(self):
         from PIL import Image
         logger.info(f"Loading data from: {self.train_data_dir}")
+        
+        mapping = load_dataset_json_mapping(self.train_data_dir)
+        if mapping is not None:
+            pairs, skipped = resolve_dataset_json_entries(self.train_data_dir, mapping, self.image_extensions)
+            for image_path, caption in pairs:
+                try:
+                    with Image.open(image_path) as img:
+                        width, height = img.size
+                        self.image_resolutions.append((width, height))
+                except Exception as e:
+                    logger.warning(f"Could not read image size for {image_path}: {e}")
+                    self.image_resolutions.append((self.resolution, self.resolution))
 
-        for root, _, files in os.walk(self.train_data_dir):
-            dir_name = os.path.basename(root)
-            repeats = int(dir_name.split('_')[0]) if '_' in dir_name and dir_name[0].isdigit() else 1
+                self.image_paths.append(image_path)
+                self.captions.append(caption)
+                self.repeats.append(1)  # dataset.json mode: default repeat=1
 
-            for file in files:
-                _, ext = os.path.splitext(file)
-                if ext.lower() in self.image_extensions:
-                    image_path = os.path.join(root, file)
-                    caption_path = os.path.splitext(image_path)[0] + '.txt'
-
-                    caption = ''
-                    if os.path.exists(caption_path):
-                        try:
-                            with open(caption_path, 'r', encoding='utf-8') as f:
-                                caption = f.read().strip()
-                        except UnicodeDecodeError:
-                            with open(caption_path, 'r', encoding='latin-1') as f:
-                                caption = f.read().strip()
-
-                    try:
-                        with Image.open(image_path) as img:
-                            width, height = img.size
-                            self.image_resolutions.append((width, height))
-                    except Exception as e:
-                        logger.warning(f"Could not read image size for {image_path}: {e}")
-                        self.image_resolutions.append((self.resolution, self.resolution))
-
-                    self.image_paths.append(image_path)
-                    self.captions.append(caption)
-                    self.repeats.append(repeats)
+            logger.info(
+                f"Loaded {len(self.image_paths)} images from dataset.json "
+                f"(skipped {skipped} invalid/missing entries)"
+            )
+            return
 
         logger.info(f"Loaded {len(self.image_paths)} unique images")
 
@@ -1176,11 +1344,7 @@ def main():
     if use_cache:
         logger.info("Checking if cache files exist...")
         train_data_dir = config['Model']['train_data_dir']
-        image_paths = []
-        for root, _, files in os.walk(train_data_dir):
-            for file in files:
-                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                    image_paths.append(os.path.join(root, file))
+        image_paths = get_training_image_paths(train_data_dir, IMAGE_EXTENSIONS)
 
         cache_complete = True
         for image_path in image_paths:
